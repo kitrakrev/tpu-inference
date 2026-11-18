@@ -1864,6 +1864,256 @@ class TestKVCacheManager:
                 f"layer {name} has page_size_bytes={spec.page_size_bytes} "
                 f"but expected uniform={expected_uniform}")
 
+    # --- JAX (flax_nnx) hybrid attention+mamba hooks -----------------------
+
+    _JAX_MAMBA_SHAPES = ((3, 64), (8, 64, 16))
+    _JAX_MAMBA_DTYPES = (torch.bfloat16, torch.float32)
+    # (3 * 64) * 2 B + (8 * 64 * 16) * 4 B
+    _JAX_MAMBA_UNPADDED = 3 * 64 * 2 + 8 * 64 * 16 * 4
+
+    def _jax_hybrid_model_cls(self, *, layer_types_hook=True, is_hybrid=True):
+        shapes = self._JAX_MAMBA_SHAPES
+        dtypes = self._JAX_MAMBA_DTYPES
+
+        class FakeHybridJaxModel:
+
+            @classmethod
+            def is_hybrid_config(cls, hf_text_config):
+                return is_hybrid
+
+            @classmethod
+            def get_mamba_state_shape_from_config(cls, vllm_config):
+                return shapes
+
+            @classmethod
+            def get_mamba_state_dtype_from_config(cls, vllm_config):
+                return dtypes
+
+        if layer_types_hook:
+
+            def get_hybrid_layer_types(cls, vllm_config):
+                # Every 4th layer is full attention (Qwen3.5-style).
+                num_layers = vllm_config.model_config.get_num_layers(
+                    vllm_config.parallel_config)
+                return [
+                    "attention" if (i + 1) % 4 == 0 else "mamba"
+                    for i in range(num_layers)
+                ]
+
+            FakeHybridJaxModel.get_hybrid_layer_types = classmethod(
+                get_hybrid_layer_types)
+        return FakeHybridJaxModel
+
+    def _register_jax_model(self, monkeypatch, model_cls):
+        from tpu_inference.models.common import model_loader
+        monkeypatch.setitem(model_loader._MODEL_REGISTRY,
+                            self.runner.model_config.architecture, model_cls)
+
+    def _jax_attn_page_size(self):
+        model_config = self.runner.model_config
+        num_kv_heads = common_utils.get_padded_num_heads(
+            model_config.get_total_num_kv_heads(),
+            self.runner.mesh.shape["model"])
+        head_size = common_utils.get_padded_head_dim(
+            model_config.get_head_size())
+        return get_attention_page_size_bytes(
+            self.runner.mesh, self.runner.cache_config.block_size,
+            num_kv_heads, head_size, self.runner.kv_cache_dtype, False)
+
+    def _get_jax_layer_configs(self):
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        # No real devices on CPU: skip compact-mamba pool sizing.
+        with patch(
+                "tpu_inference.runner.kv_cache_manager.utils.hbm_usage_bytes",
+                side_effect=RuntimeError("no TPU")):
+            return self.runner.get_kv_cache_layer_configs()
+
+    def _assert_jax_hybrid_layer_configs(self, layer_configs, expected_kinds):
+        num_attn = expected_kinds.count("attention")
+        num_mamba = expected_kinds.count("mamba")
+        min_count, max_count = min(num_attn,
+                                   num_mamba), max(num_attn, num_mamba)
+        group_size = max_count if max_count < min_count * 1.5 else min_count
+        expected_uniform = (
+            -(-num_attn // group_size) * self._jax_attn_page_size() +
+            -(-num_mamba // group_size) * self._JAX_MAMBA_UNPADDED)
+
+        assert len(layer_configs) == len(expected_kinds)
+        for i, kind in enumerate(expected_kinds):
+            layer_cfg = layer_configs[f"layer.{i}"]
+            spec = layer_cfg.spec
+            if kind == "mamba":
+                assert layer_cfg.manager_cls is MambaManager
+                assert type(spec) is MambaSpec
+                assert spec.shapes == self._JAX_MAMBA_SHAPES
+                assert spec.dtypes == self._JAX_MAMBA_DTYPES
+                assert spec.block_size == (self.runner.cache_config.block_size)
+                params = layer_cfg.manager_config.params
+                assert params.mamba_cache_mode == (
+                    self.runner.cache_config.mamba_cache_mode)
+                assert params.num_speculative_blocks == 0
+            else:
+                assert layer_cfg.manager_cls is FullAttentionManager
+                assert type(spec) is AttentionSpec
+            assert spec.page_size_padded == expected_uniform
+            assert spec.page_size_bytes == expected_uniform
+        assert (self.runner.cache_config.mamba_page_size_padded ==
+                expected_uniform)
+        assert (self.runner.kv_cache_manager._hybrid_uniform_page_size_bytes ==
+                expected_uniform)
+
+    def test_get_kv_cache_spec_jax_hybrid_via_layer_types_hook(
+            self, monkeypatch):
+        """Opted-in JAX models get mamba specs for their mamba layers, with
+        one padded page size shared by every layer."""
+        self._register_jax_model(monkeypatch, self._jax_hybrid_model_cls())
+        num_layers = self.runner.model_config.get_num_layers(
+            self.runner.parallel_config)
+
+        layer_configs = self._get_jax_layer_configs()
+
+        expected_kinds = [
+            "attention" if (i + 1) % 4 == 0 else "mamba"
+            for i in range(num_layers)
+        ]
+        self._assert_jax_hybrid_layer_configs(layer_configs, expected_kinds)
+        # 1:3 attention:mamba => group_size = num_attn and 3 mamba groups.
+        assert self.runner.cache_config.mamba_page_size_padded == (
+            self._jax_attn_page_size() + 3 * self._JAX_MAMBA_UNPADDED)
+
+    def test_get_kv_cache_spec_jax_hybrid_installs_coordinator_hooks(
+            self, monkeypatch):
+        """Building hybrid specs installs the dual-pool coordinator hooks in
+        the calling process (the engine core under UniProcExecutor)."""
+        self._register_jax_model(monkeypatch, self._jax_hybrid_model_cls())
+        with patch("tpu_inference.runner.kv_cache_manager."
+                   "maybe_install_hybrid_coordinator_hooks") as mock_install:
+            self._get_jax_layer_configs()
+        mock_install.assert_called_once_with(self.runner.vllm_config)
+
+    def test_get_kv_cache_spec_jax_hybrid_via_hf_layer_types(
+            self, monkeypatch):
+        """Without `get_hybrid_layer_types`, layer kinds come from the HF
+        config's `layer_types`."""
+        self._register_jax_model(
+            monkeypatch, self._jax_hybrid_model_cls(layer_types_hook=False))
+        num_layers = self.runner.model_config.get_num_layers(
+            self.runner.parallel_config)
+        layer_types = [
+            "full_attention" if i % 2 else "linear_attention"
+            for i in range(num_layers)
+        ]
+        monkeypatch.setattr(self.runner.model_config.hf_text_config,
+                            "layer_types",
+                            layer_types,
+                            raising=False)
+
+        layer_configs = self._get_jax_layer_configs()
+
+        expected_kinds = [
+            "attention" if i % 2 else "mamba" for i in range(num_layers)
+        ]
+        self._assert_jax_hybrid_layer_configs(layer_configs, expected_kinds)
+
+    def test_get_kv_cache_spec_jax_hybrid_runner_slot_flag(self, monkeypatch):
+        """Mamba layer configs go through
+        `maybe_runner_slot_mamba_layer_config`, as on the torchax path."""
+        self._register_jax_model(monkeypatch, self._jax_hybrid_model_cls())
+        sentinel = MagicMock()
+        with patch(
+                "tpu_inference.runner.kv_cache_manager."
+                "maybe_runner_slot_mamba_layer_config",
+                return_value=sentinel) as mock_runner_slot:
+            layer_configs = self._get_jax_layer_configs()
+
+        mock_runner_slot.assert_called_once()
+        layer_cfg_arg, config_arg = mock_runner_slot.call_args.args
+        assert layer_cfg_arg.manager_cls is MambaManager
+        assert type(layer_cfg_arg.spec) is MambaSpec
+        assert config_arg is self.runner.vllm_config
+        assert layer_configs["layer.0"] is sentinel
+        assert layer_configs["layer.3"].manager_cls is FullAttentionManager
+
+    @pytest.mark.parametrize("variant",
+                             ["not_opted_in", "not_hybrid", "no_state_hooks"])
+    def test_get_kv_cache_spec_jax_non_hybrid_unchanged(
+            self, monkeypatch, variant):
+        """JAX models that do not (fully) opt in keep plain attention layer
+        configs."""
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        expected = self.runner.get_kv_cache_layer_configs()
+        expected_padded = self.runner.cache_config.mamba_page_size_padded
+
+        from tpu_inference.runner.kv_cache_manager import KVCacheManager
+        self.runner.kv_cache_manager = KVCacheManager(self.runner)
+        if variant == "not_opted_in":
+            model_cls = type("PlainJaxModel", (), {})
+        elif variant == "not_hybrid":
+            model_cls = self._jax_hybrid_model_cls(is_hybrid=False)
+        else:
+            model_cls = self._jax_hybrid_model_cls()
+            del model_cls.get_mamba_state_shape_from_config
+        self._register_jax_model(monkeypatch, model_cls)
+
+        layer_configs = self._get_jax_layer_configs()
+
+        assert layer_configs == expected
+        assert all(cfg.manager_cls is FullAttentionManager
+                   and type(cfg.spec) is AttentionSpec
+                   for cfg in layer_configs.values())
+        assert self.runner.kv_cache_manager._hybrid_uniform_page_size_bytes is None
+        assert (
+            self.runner.cache_config.mamba_page_size_padded == expected_padded)
+
+    def test_get_kv_cache_spec_jax_hybrid_matches_torchax_page_size(
+            self, monkeypatch):
+        """The JAX and torchax paths share the page-size padding helper, so
+        the same topology yields the same uniform page size."""
+        from tpu_inference.runner.kv_cache_manager import KVCacheManager
+        attn_page = 1024 * 1024
+        jax_manager = KVCacheManager(self.runner)
+        torchax_manager = KVCacheManager(self.runner)
+
+        class DummyMamba(MambaBase):
+
+            def __init__(self):
+                super().__init__()
+
+            def get_state_shape(self):
+                return TestKVCacheManager._JAX_MAMBA_SHAPES
+
+            def get_state_dtype(self):
+                return TestKVCacheManager._JAX_MAMBA_DTYPES
+
+            @property
+            def mamba_type(self):
+                return "dummy"
+
+        self.runner.cache_config.mamba_block_size = (
+            self.runner.cache_config.block_size)
+        layers = {f"linear_attn.{i}": DummyMamba() for i in range(30)}
+        for i in range(10):
+            mock_attn = MagicMock(spec=Attention)
+            mock_attn.num_kv_heads = 2
+            mock_attn.head_size = 256
+            layers[f"full_attn.{i}"] = mock_attn
+
+        with patch(
+                "tpu_inference.runner.kv_cache_manager."
+                "get_attention_page_size_bytes",
+                return_value=attn_page), \
+             patch(
+                "tpu_inference.runner.kv_cache_manager.utils.hbm_usage_bytes",
+                side_effect=RuntimeError("no TPU")):
+            torchax_manager.update_mamba_page_size_padded(layers)
+            torchax_uniform = torchax_manager._hybrid_uniform_page_size_bytes
+            jax_manager._set_hybrid_uniform_page_size(attn_page,
+                                                      self._JAX_MAMBA_UNPADDED,
+                                                      10, 30)
+
+        assert torchax_uniform == attn_page + 3 * self._JAX_MAMBA_UNPADDED
+        assert jax_manager._hybrid_uniform_page_size_bytes == torchax_uniform
+
     def _run_compact_mamba_override(self,
                                     manager,
                                     *,
